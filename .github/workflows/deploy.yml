@@ -1,0 +1,228 @@
+name: Deploy Feedback Analyzer
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    types: [closed]
+    branches: [main]
+
+env:
+  AWS_REGION: us-east-1
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    if: github.event.pull_request.merged == true || github.event_name == 'push'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Check for incomplete jobs
+        id: job_check
+        env:
+          FEEDBACK_EC2_IP: ${{ secrets.FEEDBACK_EC2_IP }}
+          PRIVATE_KEY: ${{ secrets.INTELLIGENCE_EC2_SSH_KEY }}
+        run: |
+          echo "$PRIVATE_KEY" | base64 -d > private_key.pem
+          chmod 600 private_key.pem
+
+          echo "Checking for incomplete jobs..."
+          ssh -i private_key.pem -o StrictHostKeyChecking=no ubuntu@$FEEDBACK_EC2_IP "cd /opt/unc-feedback-analyzer && source venv/bin/activate && python3.11 job_status.py" || exit_code=$?
+          if [ "${exit_code:-0}" -eq 1 ]; then
+            echo "Warning: Incomplete job found. Deployment will continue."
+            echo "incomplete_jobs=true" >> $GITHUB_OUTPUT
+          else
+            echo "No incomplete jobs found or check skipped."
+            echo "incomplete_jobs=false" >> $GITHUB_OUTPUT
+          fi
+
+          rm -f private_key.pem
+
+      - name: Stop next job processing
+        env:
+          FEEDBACK_EC2_IP: ${{ secrets.FEEDBACK_EC2_IP }}
+          PRIVATE_KEY: ${{ secrets.INTELLIGENCE_EC2_SSH_KEY }}
+        run: |
+          echo "$PRIVATE_KEY" | base64 -d > private_key.pem
+          chmod 600 private_key.pem
+
+          echo "Stopping job processing..."
+          ssh -i private_key.pem -o StrictHostKeyChecking=no ubuntu@$FEEDBACK_EC2_IP "cd /opt/unc-feedback-analyzer && source venv/bin/activate && python3.11 stop_job.py" || exit_code=$?
+          if [ "${exit_code:-0}" -eq 0 ]; then
+            echo "Successfully stopped job processing (run_next_job set to false)"
+          else
+            echo "ERROR: Failed to stop job processing!"
+            echo "Deployment aborted to prevent concurrent job execution issues."
+            exit 1
+          fi
+
+          rm -f private_key.pem
+
+      - name: Check deployment readiness
+        if: steps.job_check.outputs.incomplete_jobs == 'true'
+        run: |
+          echo "ERROR: Cannot proceed with deployment - incomplete jobs detected!"
+          echo "Please wait for all pending jobs to complete before deploying."
+          echo "Retry the deployment in a few minutes when all jobs have finished processing."
+          echo ""
+          echo "You can check job status by running: python job_status.py"
+          exit 1
+
+      - name: Resume job processing
+        env:
+          FEEDBACK_EC2_IP: ${{ secrets.FEEDBACK_EC2_IP }}
+          PRIVATE_KEY: ${{ secrets.INTELLIGENCE_EC2_SSH_KEY }}
+        run: |
+          # Decode the private key
+          echo "$PRIVATE_KEY" | base64 -d > private_key.pem
+          chmod 600 private_key.pem
+
+          echo "Resuming job processing on EC2..."
+
+          # Check and run resume_job.py in the venv
+          ssh -i private_key.pem -o StrictHostKeyChecking=no ubuntu@$FEEDBACK_EC2_IP "
+            if [ -f /opt/unc-feedback-analyzer/resume_job.py ]; then
+              cd /opt/unc-feedback-analyzer && \
+              source venv/bin/activate && \
+              python3.11 resume_job.py
+            else
+              echo 'resume_job.py not found, skipping resume step.'
+              exit 0
+            fi
+          "
+          if [ $? -ne 0 ]; then
+            echo 'ERROR: Failed to resume job processing'
+            exit 1
+          fi
+
+          # Clean up
+          rm -f private_key.pem
+
+      - name: Deploy to EC2
+        env:
+          FEEDBACK_EC2_IP: ${{ secrets.FEEDBACK_EC2_IP }}
+          PRIVATE_KEY: ${{ secrets.INTELLIGENCE_EC2_SSH_KEY }}
+        run: |
+          echo "$PRIVATE_KEY" | base64 -d > private_key.pem
+          chmod 600 private_key.pem
+
+          # Prepare remote directories (no git clone; we'll sync files)
+          ssh -i private_key.pem -o StrictHostKeyChecking=no ubuntu@$FEEDBACK_EC2_IP << 'EOF'
+          set -e
+          APP_DIR=/opt/unc-feedback-analyzer
+          LOG_DIR=$APP_DIR/logs
+          sudo mkdir -p $APP_DIR
+          sudo chown -R ubuntu:ubuntu $APP_DIR
+          sudo mkdir -p $LOG_DIR
+          sudo chown -R ubuntu:ubuntu $LOG_DIR
+          EOF
+
+          # Sync current workspace to EC2 (avoids private repo clone issues)
+          rsync -az --delete \
+            --exclude '.git/' \
+            --exclude '.github/' \
+            --exclude 'venv/' \
+            --exclude 'logs/' \
+            -e "ssh -i private_key.pem -o StrictHostKeyChecking=no" \
+            ./ ubuntu@$FEEDBACK_EC2_IP:/opt/unc-feedback-analyzer/
+
+          # Finalize environment and dependencies on EC2
+          ssh -i private_key.pem -o StrictHostKeyChecking=no ubuntu@$FEEDBACK_EC2_IP << 'EOF'
+          set -e
+          APP_DIR=/opt/unc-feedback-analyzer
+          LOG_DIR=$APP_DIR/logs
+          cd $APP_DIR
+
+          # Ensure Python 3.11 is available
+          if ! command -v python3.11 >/dev/null 2>&1; then
+            if [ -x /usr/bin/apt-get ]; then
+              export DEBIAN_FRONTEND=noninteractive
+              sudo apt-get update -y
+              sudo apt-get install -y software-properties-common
+              sudo add-apt-repository -y ppa:deadsnakes/ppa
+              sudo apt-get update -y
+              sudo apt-get install -y python3.11 python3.11-venv
+            else
+              echo "python3.11 not found and automatic install is not supported on this distro." >&2
+              exit 1
+            fi
+          fi
+          if [ ! -d "venv" ]; then
+            python3.11 -m venv venv
+          fi
+          source venv/bin/activate
+          venv/bin/python3.11 -m pip install --upgrade pip setuptools wheel
+          venv/bin/python3.11 -m pip install "dask[complete]"
+          venv/bin/python3.11 -m pip install --upgrade --force-reinstall torch --index-url https://download.pytorch.org/whl/cpu
+          venv/bin/python3.11 -m pip install accelerate
+          venv/bin/python3.11 -m pip install -r requirements.txt
+          touch $LOG_DIR/feedback-analyzer.log
+          touch $LOG_DIR/process.log
+          chmod 664 $LOG_DIR/*.log
+          echo "Deployment finished on EC2"
+          EOF
+
+          rm -f private_key.pem
+
+      - name: Start process on EC2
+        env:
+          FEEDBACK_EC2_IP: ${{ secrets.FEEDBACK_EC2_IP }}
+          PRIVATE_KEY: ${{ secrets.INTELLIGENCE_EC2_SSH_KEY }}
+        run: |
+          echo "$PRIVATE_KEY" | base64 -d > private_key.pem
+          chmod 600 private_key.pem
+
+          ssh -i private_key.pem -o StrictHostKeyChecking=no ubuntu@$FEEDBACK_EC2_IP << 'EOF'
+          set -e
+
+          APP_DIR=/opt/unc-feedback-analyzer
+          LOG_DIR=$APP_DIR/logs
+
+          cd $APP_DIR
+
+          # Kill existing Python processes running process.py
+          echo "Checking for running process.py..."
+          pids=$(pgrep -f "python.*process.py" || true)
+          if [ ! -z "$pids" ]; then
+            echo "⚠ Found existing processes: $pids"
+            kill -9 $pids || true
+            sleep 2
+          fi
+
+          # Activate virtual environment and start process
+          echo "Starting process.py..."
+          source venv/bin/activate
+          nohup venv/bin/python3.11 process.py > $LOG_DIR/process.log 2>&1 &
+          new_pid=$!
+          echo "process.py started with PID $new_pid"
+
+          # Verify process
+          sleep 2
+          if kill -0 $new_pid 2>/dev/null; then
+            echo "Process is running successfully"
+          else
+            echo "Process failed to start"
+            exit 1
+          fi
+          EOF
+
+          rm -f private_key.pem
+
+      - name: Deployment Status
+        env:
+          INCOMPLETE_JOBS: ${{ steps.job_check.outputs.incomplete_jobs }}
+        run: |
+          echo "Deployment completed successfully!"
+          echo "Feedback Analyzer deployed to EC2"
+          if [ "${INCOMPLETE_JOBS:-false}" == "true" ]; then
+            echo "Note: There are incomplete jobs in the database"
+          fi
