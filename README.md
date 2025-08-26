@@ -1,5 +1,4 @@
-### Unc Feedback Analyzer
-
+### Job Process Service
 A lightweight batch worker that ingests customer feedback from a database, performs NLP analysis (sentiment + zero‑shot topic classification), computes word counts, and indexes results into OpenSearch for search/analytics. The worker maintains job state in the database and runs on a simple schedule.
 
 
